@@ -24,4 +24,4 @@
 
 ## SINGLE PROCESS SETUP
 - running for particular test scenario and generating a log file called "testcasename.txt"
-  python3 -m da --logfile --logfilename testcasename.txt --logfilelevel 'info' --message-buffer-size size_bytes BCR.da test1.txt
+   - python3 -m da --logfile --logfilename testcasename.txt --logfilelevel 'info' --message-buffer-size size_bytes BCR.da test1.txt
