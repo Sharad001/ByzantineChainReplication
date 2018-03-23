@@ -1,0 +1,69 @@
+#!/usr/bin/python3
+
+# Steps to run the multihost version of this program.
+# To start olympus on other node, olympus = new(OLYMPUS.Olympus, num = 1, at='PongNode')
+# To execute : python -m da -n PingNode -D --hostname 172.24.22.192 BCR.da testcase.txt 
+# olympus = new(OLYMPUS.Olympus, num = 1, at='PongNode@192.168.163.1')
+# To execute  : python -m da -n PingNode --hostname 172.24.22.192 BCR.da testcase.txt
+
+import sys
+import os
+import time
+import random
+import datetime
+import string
+CLIENT = import_da('client')
+OLYMPUS = import_da('olympus')
+config(channel is {fifo,reliable}, clock is lamport)
+from utils import Utils, State
+
+def main():
+	config = {}
+	if len(sys.argv) > 1:
+		with open(sys.argv[1],'r') as f:
+			for line in f:
+				if line[0] != '#':
+					(key,sep,val) = line.partition('=')
+					# if the line does not contain '=', it is invalid and hence ignored
+					if len(sep) != 0:
+						val = val.strip()
+						config[key.strip()] = int(val) if str.isdecimal(val) else val
+		output("Current Settings : " + str(config))
+		clientPrivateKeys = []
+		clientPublicKeys = []
+		clientIds = []
+		failures = {}
+		num_clients = config['num_client']
+		num_replicas = 2*config['t'] + 1
+		client_timeout = int(config['client_timeout'])
+		head_timeout = int(config['head_timeout'])
+		nonhead_timeout = int(config['nonhead_timeout'])
+		if 'checkpt_interval' in config:
+			checkpt_interval = int(config['checkpt_interval'])
+		else:
+			checkpt_interval = 10
+			
+		workload_for_clients = {}
+		for key in config.keys():
+			if "failures" in key:
+				keyf = key[key.find('[')+1:key.find(']')]
+				failures[keyf] = config[key]
+		for i in range(num_clients):
+			workload_for_clients[i] = config['workload['+str(i)+']']
+
+		(olympusPrivateKey,olympusPublicKey) = Utils.getSignedKey(self)
+
+		for i in range(num_clients):
+			(clientPrivateKey, clientPublicKey) = Utils.getSignedKey(self)
+			clientPrivateKeys.append(clientPrivateKey)
+			clientPublicKeys.append(clientPublicKey)
+			clientIds.append('c'+ str(i))
+
+		olympus = new(OLYMPUS.Olympus)
+
+		clients = list(new(CLIENT.Client, num=num_clients))
+		for i in range(num_clients):
+		    setup(clients[i], (olympus, clientIds[i], olympusPublicKey, workload_for_clients[i], clientPrivateKeys[i], client_timeout))
+		setup(olympus, (olympusPrivateKey, olympusPublicKey, clientPublicKeys, num_replicas, clients, head_timeout, nonhead_timeout, failures, checkpt_interval))
+		start(olympus)
+		start(clients)

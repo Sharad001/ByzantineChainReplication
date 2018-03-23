@@ -1,0 +1,1167 @@
+#!/usr/bin/python
+import sys
+import os
+import time
+import random
+import string
+import copy
+from datetime import datetime
+from utils import Utils, State
+from operation import Operation
+from datetime import datetime
+from orderStatement import OrderStatement
+from resultStatement import ResultStatement
+from checkpointStatement import CheckpointStatement
+from wedgedMessage import WedgedMessage
+from shuttle import Shuttle
+from checkpointShuttle import CheckpointShuttle
+CLIENT = import_da('client')
+OLYMPUS = import_da('olympus')
+config(channel is {fifo,reliable}, clock is lamport)
+
+class Replica(process):
+	def setup(olympus, replicaPublicKeys, replicaPrivateKey, olympusPublicKey, state, head_timeout, nonhead_timeout, failures, checkpt_interval, runningstate, clientPublicKeys):
+		self.state = state
+		self.olympus = olympus
+		self.replicaPublicKeys = replicaPublicKeys
+		self.olympusPublicKey = olympusPublicKey
+		self.replicaPrivateKey = replicaPrivateKey
+		self.clientPublicKeys = clientPublicKeys
+		self.isHeadFlag = False
+		self.isTailFlag = False
+		self.predecessorReplica = None
+		self.successorReplica = None
+		self.Id = None
+		self.head=None
+		self.tail = None
+		self.nonhead_timeout = nonhead_timeout
+		self.head_timeout = head_timeout
+		self.runningstate = runningstate
+		self.requestIdToForwardedRequests = {}
+		self.requestIdToResultShuttle = {}
+		self.slotNo = -1
+		self.failures = failures
+		self.inProcessRequestIds = {}
+		self.historyoforderproofs = []
+		self.historyofcheckpointproofs = []
+		self.utils = Utils()
+		self.checkpt_interval = checkpt_interval
+		self.runningstateForCheckpoint = {}
+		self.lastresultstatement = {}
+
+		##For Failure Triggers
+		self.directlyfromclient = {}
+		self.forwardedmessageforclient = {}
+		self.shuttleforclient = {}
+		self.resultshuttleforclient = {}
+		self.failureInjections = {}
+		self.checkpoints = -1
+		self.completed_checkpoints = -1
+		self.catch_up = -1
+		self.wedge_request =-1
+		self.get_running_state = -1
+
+		##Failure Trigger##########
+		failurekey = "new_configuration("+str(0)+")"
+		if failurekey in self.failures:
+			try:
+				self.failureInjections[self.failures[failurekey]] +=1
+			except KeyError:
+				self.failureInjections[self.failures[failurekey]] = 1
+		###########################
+
+		####Failure Injections called just after triggers #####
+		if any(key.startswith('sleep') for key in self.failureInjections): ##Sleep
+			sleep = [ key for key in self.failureInjections.keys() if 'sleep' in key][0]
+			output("Sleep Time Failure Triggered at replica: " + str(self))
+			self.failureInjections[sleep] -=1
+			if self.failureInjections[sleep] == 0:
+				self.failureInjections.pop(sleep)
+			sleeptime = sleep[sleep.find('(')+1:sleep.find(')')]
+			time.sleep(int(sleeptime))
+
+		if "crash()" in self.failureInjections : ##Crash Replica
+			output("Killing Replica Failure Triggered at replica: " + str(self))
+			os._exit(-1)
+			return
+
+		if "drop()" in self.failureInjections : ##Drop Message
+			output("Drop Failure Triggered at replica: " + str(self) + " during sending shuttle forward")
+			self.failureInjections["drop()"] -=1
+			if self.failureInjections["drop()"] == 0:
+				self.failureInjections.pop("drop()")
+			return
+
+		if "increment_slot()" in self.failureInjections : ##Increment Slot Message
+			output("Increment Slot Failure Triggered at replica: " + str(self))
+			self.failureInjections["increment_slot()"] -=1
+			if self.failureInjections["increment_slot()"] == 0:
+				self.failureInjections.pop("increment_slot()")
+			if self.isHeadFlag:
+				self.slotNo = self.slotNo + 1
+
+		if "extra_op()" in self.failureInjections : ##Extra Operation Message
+			output("Extra Operation Failure Triggered at replica: " + str(self))
+			self.failureInjections["extra_op()"] -=1
+			if self.failureInjections["extra_op()"] == 0:
+				self.failureInjections.pop("extra_op()")
+			execute_operation("put", "a", "a")
+		#######################################################
+
+
+	def run():
+		output("********Starting Replica" + str(self)+ "*****")
+		-- yieldInitializeHistory
+		await(some(received(('Become Active',_, _, _,_), from_ = olympus)))
+		await(some(received(('Finised Processing'), from_ = olympus)))
+
+
+	def check_validity_of_order_proof(shuttle):
+			order_statements = shuttle.order_proof
+			operation_object = shuttle.operation
+			for i in range(0, len(order_statements)):
+				try:
+					order_statement = utils.verifySignature(order_statements[i], self.replicaPublicKeys[i]).decode('UTF-8')
+					if str(order_statement)!=str(operation_object):
+						return False
+
+				except:
+					return False
+			return True
+
+	def check_validity_of_result_proof(shuttle, result):
+		result_statements = shuttle.result_proof
+		for i in range(0, len(result_statements)):
+			try:
+				statement = utils.verifySignature(result_statements[i] , replicaPublicKeys[i])
+				hash = statement.decode('UTF-8').split(';')[-1]
+				if utils.verifyHash(result, hash.encode('utf-8')) == False:
+					return False
+			except:
+				return False
+		return True
+
+	def execute_operation(operation, key, value):
+
+		output = "None"
+		if operation == "put" :
+			self.runningstate[key] = value
+			output = "OK"
+		elif operation == "get":
+			if key in self.runningstate:
+				output = self.runningstate[key]
+			else:
+				output = ""
+		elif operation == "slice":
+			if key in self.runningstate:
+				(i,j) = value.split(':')
+				val = self.runningstate[key]
+				if int(j)<len(val) and int(i)>=0:
+					self.runningstate[key] = val[int(i):int(j)]
+					output = "OK"
+				else:
+					output = "Fail"
+		elif operation == "append":
+			if key in self.runningstate:
+				self.runningstate[key]+=str(value)
+				output = "OK"
+			else:
+				output = "Fail"
+		return output
+
+	def execute_operation_of_client(client, shuttle, signed_workload):
+
+		operation_object = copy.deepcopy(shuttle.operation)
+		requestId = operation_object.requestId
+		order_proof = shuttle.order_proof
+		result_proof = shuttle.result_proof
+
+		if self.state == State.ACTIVE.value:
+
+
+			#### Checking for client request signature ##########
+			clientId = requestId.split(':')[0][1:]
+			decoded_workload = ""
+			verification = True
+			try:
+				decoded_workload = utils.verifySignature(signed_workload, self.clientPublicKeys[int(clientId)]).decode('UTF-8')
+			except Exception:
+				verification = False
+			actual_workload = Operation().getWorkload(operation_object)
+			if str(decoded_workload) != str(actual_workload) or verification == False:
+				output("Proof of Misbehaviour detected at replica " + str(self) + " due to invalid signature of client" + str(client) + "for requestid: " + requestId)
+				output("Sending Reconfiguration Request to Olympus from Replica " + str(self))
+				send(('Reconfiguration request from replica', self), to = olympus)
+				return
+			#####################################################
+
+			#### Checking for holes #############################
+			if self.isHeadFlag == False and operation_object.slotNo != self.slotNo + 1:
+				output("Proof of Misbehaviour detected at replica " + str(self) + " due to holes at requestid: " + requestId)
+				output("Expected slot No: " + str(self.slotNo + 1) + " , Actual slotNo recieved : " + str(operation_object.slotNo))
+				output("Sending Reconfiguration Request to Olympus from Replica " + str(self))
+				send(('Reconfiguration request from replica', self), to = olympus)
+				return
+			#####################################################
+
+			if check_validity_of_order_proof(shuttle):
+				output("Executing operation: " + operation_object.command + " with requestId "+ operation_object.requestId + " at replica " + str(self))
+
+
+				##variables updation
+				self.slotNo = operation_object.slotNo
+				self.inProcessRequestIds[requestId] = 1
+				msgNo = int(requestId.split(':')[1])
+				cid = requestId.split(':')[0]
+
+				##Failure Injections#################
+				if "change_operation()" in self.failureInjections : ##Change Operation
+					output("Change Operation Failure Triggered at replica: " + str(self))
+					operation_object.command = "get"
+					operation_object.key = "x"
+					operation_object.value = ""
+					self.failureInjections["change_operation()"] -=1
+					if self.failureInjections["change_operation()"] == 0:
+						self.failureInjections.pop("change_operation()")
+
+				#######################################
+
+				## order statement created
+				order_statement = OrderStatement()
+				order_statement.operation = operation_object
+
+				##order statement signed
+				signed_order_statement = utils.getSignedStatement(self.replicaPrivateKey, str(order_statement))
+
+				##Failure Injections#################
+				if "invalid_order_sig()" in self.failureInjections : ##Invalid Order Signature Operation
+					output("Invalid Order Statement Signature Failure Triggered at replica: " + str(self))
+					signed_order_statement = utils.getInvalidSignedStatement(signed_order_statement)
+					self.failureInjections["invalid_order_sig()"] -=1
+					if self.failureInjections["invalid_order_sig()"] == 0:
+						self.failureInjections.pop("invalid_order_sig()")
+
+				#######################################
+
+				order_proof.append(signed_order_statement)
+
+
+				### operation object items
+				key = operation_object.key
+				value = operation_object.value
+				operation = operation_object.command
+
+				##get output from execution of operation
+				output = execute_operation(operation, key, value)
+
+				if self.slotNo % self.checkpt_interval == self.checkpt_interval - 1:
+					self.runningstateForCheckpoint = self.runningstate
+
+				##Failure Injections######################
+				if "change_result()" in self.failureInjections : ##Change Result
+					output("Change Result Failure Triggered at replica: " + str(self))
+					output = "OK"
+					self.failureInjections["change_result()"] -=1
+					if self.failureInjections["change_result()"] == 0:
+						self.failureInjections.pop("change_result()")
+				#########################################
+
+				result_hash = utils.getHash(output)
+				result_statement = ResultStatement()
+				result_statement.operation = operation_object
+				result_statement.result = result_hash
+				signed_result_statement = utils.getSignedStatement(self.replicaPrivateKey, str(result_statement))
+
+				##Failure Injections#################
+				if "invalid_result_sig()" in self.failureInjections : ##Invalid Result Signature Operation
+					output("Invalid Result Statement Signature Failure Triggered at replica: " + str(self))
+					#if self.isTailFlag:
+					signed_result_statement = utils.getInvalidSignedStatement(signed_result_statement)
+					self.failureInjections["invalid_result_sig()"] -=1
+					if self.failureInjections["invalid_result_sig()"] == 0:
+						self.failureInjections.pop("invalid_result_sig()")
+				#########################################
+
+				result_proof.append(signed_result_statement)
+
+				##Failure Injections######################
+				
+				if "drop_result_stmt()" in self.failureInjections : ##Omit Result statement
+#		print("Before changing " + str(result_proof))
+					output("Omit Result Statement Failure Triggered at replica: " + str(self))
+					shuttle.result_proof = shuttle.result_proof[1:]
+					self.failureInjections["drop_result_stmt()"] -=1
+					if self.failureInjections["drop_result_stmt()"] == 0:
+						self.failureInjections.pop("drop_result_stmt()")
+				#########################################
+
+
+				self.historyoforderproofs.append(order_proof)
+				self.lastresultstatement[cid] = (output, signed_result_statement, operation_object)
+				
+				if self.isTailFlag == True:
+					result_shuttle = Shuttle()
+					result_shuttle.operation = operation_object
+					result_statement.result = result_hash
+					result_shuttle.result_proof = result_proof
+					self.inProcessRequestIds[requestId] = 0
+					self.requestIdToResultShuttle[requestId] = (output, result_shuttle)
+					send(('Forward Result to Client', output, result_shuttle.result_proof, requestId), to = client)
+					send(('Forward Shuttle to Predecessor', result_shuttle, output, requestId), to = self.predecessorReplica)
+
+				else:
+					send(('Forward Shuttle To Successor', shuttle, client, signed_workload), to = self.successorReplica)
+			else:
+				output("Proof of Misbehaviour detected at replica " + str(self) + " due to invalid order proof of request: " + requestId)
+				output("Sending Reconfiguration Request to Olympus from Replica " + str(self))
+				send(('Reconfiguration request from replica', self), to = olympus)
+
+		else:
+			output("Replica " + str(self) + " is immutable now")
+
+
+	def receive(msg = ('Forward Shuttle To Successor', shuttle, client, signed_workload), from_ = self.predecessorReplica):
+		operation_object = copy.deepcopy(shuttle.operation)
+		output("Received shuttle from the previous replica -> " + str(self.predecessorReplica) + " on replica " + str(self) + " for operation: "+ operation_object.command + " and request: " + operation_object.requestId)
+
+		if self.state == State.ACTIVE.value:
+			cid = operation_object.requestId.split(':')[0]
+			try:
+				self.shuttleforclient[cid]+=1
+			except KeyError:
+				self.shuttleforclient[cid]=0
+			m = self.shuttleforclient[cid]
+#			print(str(self.shuttleforclient) + " in replica" + str(self))
+			##Failure Trigger##########
+			failurekey = "shuttle("+str(cid[1:])+","+str(m)+")"
+			if failurekey in self.failures:
+				try:
+					self.failureInjections[self.failures[failurekey]] +=1
+				except KeyError:
+					self.failureInjections[self.failures[failurekey]] = 1
+#			print("Reuqest id " + operation_object.requestId)
+#			print("Failure key" + failurekey)
+#			print("failures " + str(self.failures))
+#			print("Injections at replica during forwrding shuttle"+ str(self) +" " + str(self.failureInjections))
+			###########################
+
+			####Failure Injections called just after triggers #####
+			if any(key.startswith('sleep') for key in self.failureInjections): ##Sleep
+				sleep = [ key for key in self.failureInjections.keys() if 'sleep' in key][0]
+				output("Sleep Time Failure Triggered at replica: " + str(self))
+				self.failureInjections[sleep] -=1
+				if self.failureInjections[sleep] == 0:
+					self.failureInjections.pop(sleep)
+				sleeptime = sleep[sleep.find('(')+1:sleep.find(')')]
+				time.sleep(int(sleeptime))
+
+			if "crash()" in self.failureInjections : ##Crash Replica
+				output("Killing Replica Failure Triggered at replica: " + str(self))
+				os._exit(-1)
+				return
+
+			if "drop()" in self.failureInjections : ##Drop Message
+				output("Drop Failure Triggered at replica: " + str(self) + " during sending shuttle forward")
+				self.failureInjections["drop()"] -=1
+				if self.failureInjections["drop()"] == 0:
+					self.failureInjections.pop("drop()")
+				return
+
+			if "extra_op()" in self.failureInjections : ##Extra Operation Message
+				output("Extra Operation Failure Triggered at replica: " + str(self))
+				self.failureInjections["extra_op()"] -=1
+				if self.failureInjections["extra_op()"] == 0:
+					self.failureInjections.pop("extra_op()")
+				execute_operation("put", "a", "a")
+			#######################################################
+			execute_operation_of_client(client, shuttle, signed_workload)
+
+	def receive(msg = ('Forward Shuttle to Predecessor', result_shuttle, result, requestId), from_ = self.successorReplica):
+		output("Received result shuttle from the successor replica -> " + str(self.successorReplica) + " on replica " + str(self) + " for request: " + requestId)
+		if self.state == State.ACTIVE.value:
+
+			cid = requestId.split(':')[0]
+			try:
+				self.resultshuttleforclient[cid]+=1
+			except KeyError:
+				self.resultshuttleforclient[cid]=0
+			m = self.resultshuttleforclient[cid]
+
+			##Failure Trigger##########
+			failurekey = "result_shuttle("+str(cid[1:])+","+str(m)+")"
+			if failurekey in self.failures:
+				try:
+					self.failureInjections[self.failures[failurekey]] +=1
+				except KeyError:
+					self.failureInjections[self.failures[failurekey]] = 1
+			###########################
+
+			####Failure Injections called just after triggers #####
+			if any(key.startswith('sleep') for key in self.failureInjections): ##Sleep
+				sleep = [ key for key in self.failureInjections.keys() if 'sleep' in key][0]
+				output("Sleep Time Failure Triggered at replica: " + str(self))
+				self.failureInjections[sleep] -=1
+				if self.failureInjections[sleep] == 0:
+					self.failureInjections.pop(sleep)
+				sleeptime = sleep[sleep.find('(')+1:sleep.find(')')]
+				time.sleep(int(sleeptime))
+
+			if "crash()" in self.failureInjections : ##Crash Replica
+				output("Killing Replica Failure Triggered at replica: " + str(self))
+				os._exit(-1)
+				return
+
+			if "drop()" in self.failureInjections : ##Drop Message
+				output("Drop Failure Triggered at replica: " + str(self) + " during sending result shuttle backward")
+				self.failureInjections["drop()"] -=1
+				if self.failureInjections["drop()"] == 0:
+					self.failureInjections.pop("drop()")
+				return
+
+			if "increment_slot()" in self.failureInjections : ##Increment Slot Message
+				output("Increment Slot Failure Triggered at replica: " + str(self))
+				self.failureInjections["increment_slot()"] -=1
+				if self.failureInjections["increment_slot()"] == 0:
+					self.failureInjections.pop("increment_slot()")
+				if self.isHeadFlag:
+					self.slotNo = self.slotNo + 1
+
+			if "extra_op()" in self.failureInjections : ##Extra Operation Message
+				output("Extra Operation Failure Triggered at replica: " + str(self))
+				self.failureInjections["extra_op()"] -=1
+				if self.failureInjections["extra_op()"] == 0:
+					self.failureInjections.pop("extra_op()")
+				execute_operation("put", "a", "a")
+			#######################################################
+
+			if check_validity_of_result_proof(result_shuttle, result):
+				self.inProcessRequestIds[requestId] = 0
+				self.requestIdToResultShuttle[requestId] = (result, result_shuttle)
+
+				##Check for failure injections here###############
+				if "change_result()" in self.failureInjections : ##Change Result
+					output("Change Result Statement Failure Triggered at replica: " + str(self))
+					output = "OK"
+					result_hash = utils.getHash(output)
+					result_statement = ResultStatement()
+					result_statement.result = result_hash
+					signed_result_statement = utils.getSignedStatement(self.replicaPrivateKey, str(result_statement))
+					result_shuttle.result_proof[int(self.Id[1:])] = signed_result_statement
+					result_shuttle.result = result_hash
+					self.failureInjections["change_result()"] -=1
+					if self.failureInjections["change_result()"] == 0:
+						self.failureInjections.pop("change_result()")
+
+				if "drop_result_stmt()" in self.failureInjections : ##Omit Result statement
+					output("Omit Result Statement Failure Triggered at replica: " + str(self))
+					result_shuttle.result_proof = result_shuttle.result_proof[1:]
+					self.failureInjections["drop_result_stmt()"] -=1
+					if self.failureInjections["drop_result_stmt()"] == 0:
+						self.failureInjections.pop("drop_result_stmt()")
+				##################################################
+
+				if isHeadFlag != True:
+					send(('Forward Shuttle to Predecessor', result_shuttle, result, requestId), to = self.predecessorReplica)
+			else:
+				output("Proof of Misbehaviour detected at replica " + str(self) + " due to invalid result proof of request: " + requestId)
+				output("Sending Reconfiguration Request to Olympus from Replica " + str(self))
+				send(('Reconfiguration request from replica', self), to = olympus)
+		else:
+			output("Replica " + str(self) + " is immutable now")
+
+	def receive(msg = ('Execute Operation Of Client', operation_object, client, signed_workload), from_ = p):
+		if self.state == State.ACTIVE.value :
+			output("Received operation_object " + str(operation_object) + " on head: " + str(self) + " for requestId: " + operation_object.requestId)
+
+			cid = operation_object.requestId.split(':')[0]
+			try:
+				self.directlyfromclient[cid]+=1
+			except KeyError:
+				self.directlyfromclient[cid]=0
+			m = self.directlyfromclient[cid]
+
+			##Failure Trigger##########
+			failurekey = "client_request("+str(cid[1:])+","+str(m)+")"
+			if failurekey in self.failures:
+				try:
+					self.failureInjections[self.failures[failurekey]] +=1
+				except KeyError:
+					self.failureInjections[self.failures[failurekey]] = 1
+			###########################
+
+			####Failure Injections called just after triggers #####
+			if any(key.startswith('sleep') for key in self.failureInjections): ##Sleep
+				sleep = [ key for key in self.failureInjections.keys() if 'sleep' in key][0]
+				output("Sleep Time Failure Triggered at replica: " + str(self))
+				self.failureInjections[sleep] -=1
+				if self.failureInjections[sleep] == 0:
+					self.failureInjections.pop(sleep)
+				sleeptime = sleep[sleep.find('(')+1:sleep.find(')')]
+				time.sleep(int(sleeptime))
+
+			if "crash()" in self.failureInjections : ##Crash Replica
+				output("Killing Replica Failure Triggered at replica: " + str(self))
+				os._exit(-1)
+				return
+
+			if "drop()" in self.failureInjections : ##Drop Message
+				output("Drop Failure Triggered at replica: " + str(self) + " when receiving operation from client")
+				self.failureInjections["drop()"] -=1
+				if self.failureInjections["drop()"] == 0:
+					self.failureInjections.pop("drop()")
+				return
+			if "increment_slot()" in self.failureInjections : ##Increment Slot Message
+				output("Increment Slot Failure Triggered at replica: " + str(self))
+				self.failureInjections["increment_slot()"] -=1
+				if self.failureInjections["increment_slot()"] == 0:
+					self.failureInjections.pop("increment_slot()")
+				if self.isHeadFlag:
+					self.slotNo = self.slotNo + 1
+
+			if "extra_op()" in self.failureInjections : ##Extra Operation Message
+				output("Extra Operation Failure Triggered at replica: " + str(self))
+				self.failureInjections["extra_op()"] -=1
+				if self.failureInjections["extra_op()"] == 0:
+					self.failureInjections.pop("extra_op()")
+				execute_operation("put", "a", "a")
+			#######################################################
+			
+			##Creating new shuttle here###
+			self.slotNo = self.slotNo + 1
+			operation_object.slotNo = self.slotNo
+			shuttle = Shuttle()
+			shuttle.operation = operation_object
+			#############################
+
+			execute_operation_of_client(client, shuttle, signed_workload)
+			initiate_checkpoint_periodically()
+
+	def initiate_checkpoint_periodically():
+		if self.state == State.ACTIVE.value:
+			
+			self.checkpoints += 1
+			##Failure Trigger##########
+			failurekey = "checkpoint("+str(self.checkpoints)+")"
+			if failurekey in self.failures:
+				try:
+					self.failureInjections[self.failures[failurekey]] +=1
+				except KeyError:
+					self.failureInjections[self.failures[failurekey]] = 1
+			###########################
+
+			####Failure Injections called just after triggers #####
+			if any(key.startswith('sleep') for key in self.failureInjections): ##Sleep
+				sleep = [ key for key in self.failureInjections.keys() if 'sleep' in key][0]
+				output("Sleep Time Failure Triggered at replica: " + str(self))
+				self.failureInjections[sleep] -=1
+				if self.failureInjections[sleep] == 0:
+					self.failureInjections.pop(sleep)
+				sleeptime = sleep[sleep.find('(')+1:sleep.find(')')]
+				time.sleep(int(sleeptime))
+
+			if "crash()" in self.failureInjections : ##Crash Replica
+				output("Killing Replica Failure Triggered at replica: " + str(self))
+				os._exit(-1)
+				return
+
+			if "drop()" in self.failureInjections : ##Drop Message
+				output("Drop Failure Triggered at replica: " + str(self) + " during sending the checkpoint shuttle forward")
+				self.failureInjections["drop()"] -=1
+				if self.failureInjections["drop()"] == 0:
+					self.failureInjections.pop("drop()")
+				return
+
+			if "increment_slot()" in self.failureInjections : ##Increment Slot Message
+				output("Increment Slot Failure Triggered at replica: " + str(self))
+				self.failureInjections["increment_slot()"] -=1
+				if self.failureInjections["increment_slot()"] == 0:
+					self.failureInjections.pop("increment_slot()")
+				if self.isHeadFlag:
+					self.slotNo = self.slotNo + 1
+
+			if "extra_op()" in self.failureInjections : ##Extra Operation Message
+				output("Extra Operation Failure Triggered at replica: " + str(self))
+				self.failureInjections["extra_op()"] -=1
+				if self.failureInjections["extra_op()"] == 0:
+					self.failureInjections.pop("extra_op()")
+				execute_operation("put", "a", "a")
+			#######################################################
+			
+			if self.slotNo != 0 and self.slotNo % self.checkpt_interval == 0:
+				if self.isHeadFlag == True:
+					output("Initializing checkpoint upto slotNo: " + str(self.slotNo-1) + " on replica: " + str(self))
+				else:
+					output("Initializing checkpoint upto slotNo: " + str(self.slotNo) + " on replica: " + str(self))
+				checkpoint_statement = CheckpointStatement()
+				checkpoint_statement.checkpoint_slot = self.slotNo
+				#output("Running State: " + str(self.runningstateForCheckpoint))
+				checkpoint_statement.running_state = utils.getHash(str(self.runningstateForCheckpoint))
+
+				#Sign Checkpoint Statement and add to checkpoint proof
+				signed_checkpoint_statement = utils.getSignedStatement(self.replicaPrivateKey, str(checkpoint_statement))
+				checkpoint_proof = []
+				checkpoint_proof.append(signed_checkpoint_statement)
+
+                    		#Create check point shuttle and send to successor replica
+				checkpoint_shuttle = CheckpointShuttle()
+				checkpoint_shuttle.checkpoint_slot = checkpoint_statement.checkpoint_slot
+				checkpoint_shuttle.checkpoint_proof = checkpoint_proof
+				output("Sending checkpoint Shuttle to Successor Replica: " + str(self.successorReplica) + " from " + str(self))
+				send(('forward_checkpoint_shuttle', self, checkpoint_shuttle), to = self.successorReplica)
+		else:
+			output("No checkpointing as Replica " + str(self) + " is immutable now")
+
+
+	def check_validity_of_checkpoint_proof(checkpoint_proof):
+		checkpoint_set = set()
+		if len(checkpoint_proof) < (int(len(replicaPublicKeys)/2) + 1):
+			return False
+		for i in range(0, len(checkpoint_proof)):
+			verification = True
+			checkpoint_statement = ""
+			try:
+				checkpoint_statement = utils.verifySignature(checkpoint_proof[i], self.replicaPublicKeys[i]).decode('UTF-8')
+			except Exception:
+				verification = False
+			if verification == True:
+				checkpoint_set.add(checkpoint_statement)
+		
+		if len(checkpoint_set) > (int(len(replicaPublicKeys)/2) + 1):
+			return False
+		return True
+
+	def receive(msg = ('forward_checkpoint_shuttle', replica, checkpoint_shuttle)):
+		output("Received Checkpoint shuttle at replica: " + str(self) + " from replica: " + str(replica))
+
+		if self.state == State.ACTIVE.value:
+
+			self.checkpoints += 1
+			##Failure Trigger##########
+			failurekey = "checkpoint("+str(self.checkpoints)+")"
+			if failurekey in self.failures:
+				try:
+					self.failureInjections[self.failures[failurekey]] +=1
+				except KeyError:
+					self.failureInjections[self.failures[failurekey]] = 1
+#			print("Failure key" + failurekey)
+#			print("failures " + str(self.failures))
+#			print("Injections at replica during forwarding checkpoint"+ str(self) +" " + str(self.failureInjections))
+			###########################
+
+			####Failure Injections called just after triggers #####
+			if any(key.startswith('sleep') for key in self.failureInjections): ##Sleep
+				sleep = [ key for key in self.failureInjections.keys() if 'sleep' in key][0]
+				output("Sleep Time Failure Triggered at replica: " + str(self))
+				self.failureInjections[sleep] -=1
+				if self.failureInjections[sleep] == 0:
+					self.failureInjections.pop(sleep)
+				sleeptime = sleep[sleep.find('(')+1:sleep.find(')')]
+				time.sleep(int(sleeptime))
+				
+			if "crash()" in self.failureInjections : ##Crash Replica
+				output("Killing Replica Failure Triggered at replica: " + str(self))
+				os._exit(-1)
+				return
+
+			if "drop()" in self.failureInjections : ##Drop Message
+				output("Drop Failure Triggered at replica: " + str(self) + " during sending the checkpoint shuttle forward")
+				self.failureInjections["drop()"] -=1
+				if self.failureInjections["drop()"] == 0:
+					self.failureInjections.pop("drop()")
+				return
+
+			if "increment_slot()" in self.failureInjections : ##Increment Slot Message
+				output("Increment Slot Failure Triggered at replica: " + str(self))
+				self.failureInjections["increment_slot()"] -=1
+				if self.failureInjections["increment_slot()"] == 0:
+					self.failureInjections.pop("increment_slot()")
+				if self.isHeadFlag:
+					self.slotNo = self.slotNo + 1
+
+			if "extra_op()" in self.failureInjections : ##Extra Operation Message
+				output("Extra Operation Failure Triggered at replica: " + str(self))
+				self.failureInjections["extra_op()"] -=1
+				if self.failureInjections["extra_op()"] == 0:
+					self.failureInjections.pop("extra_op()")
+				execute_operation("put", "a", "a")
+			#######################################################
+
+			#validate checkpoint proof
+			if True:
+				output("Checkpoint shuttle verified at replica: " + str(self))
+				checkpoint_statement = CheckpointStatement()
+				checkpoint_statement.checkpoint_slot = checkpoint_shuttle.checkpoint_slot
+				#output("Running State: " + str(self.runningstate))
+				checkpoint_statement.running_state = utils.getHash(str(self.runningstateForCheckpoint))
+                    		#Sign Checkpoint Statement and add to checkpoint proof
+				signed_checkpoint_statement = utils.getSignedStatement(self.replicaPrivateKey, str(checkpoint_statement))
+
+				if self.isTailFlag == True:
+					checkpoint_proof = checkpoint_shuttle.checkpoint_proof
+					checkpoint_proof.append(signed_checkpoint_statement)
+					output("Checkpoint proof completed at Replica: " + str(self))
+
+					#Initialize completed checkpoint shuttle
+					completed_checkpoint_shuttle = CheckpointShuttle()
+					completed_checkpoint_shuttle.checkpoint_proof = checkpoint_proof
+
+					####Failure Injections#####
+					if "drop_checkpt_stmts()" in self.failureInjections : ##Drop Checkpoint Statements Message
+						output("Drop Checkpoint Operation Failure Triggered at replica: " + str(self))
+						self.failureInjections["drop_checkpt_stmts()"] -=1
+						if self.failureInjections["drop_checkpt_stmts()"] == 0:
+							self.failureInjections.pop("drop_checkpt_stmts()")
+						completed_checkpoint_shuttle.checkpoint_proof = completed_checkpoint_shuttle.checkpoint_proof[(int(len(self.replicaPublicKeys)/2) + 2):]
+					#######################################################
+					completed_checkpoint_shuttle.checkpoint_slot = checkpoint_shuttle.checkpoint_slot
+
+					#Remove prefix of History From Tail
+					output("Truncating history for replica: " + str(self) + " upto Slot:" + str(completed_checkpoint_shuttle.checkpoint_slot-1))
+					self.historyoforderproofs = self.historyoforderproofs[self.checkpt_interval:]
+
+					#add checkpoint proof to its history
+					self.historyofcheckpointproofs.append(checkpoint_proof)
+
+					 #Send Completed Checkpoint Shuttle backward
+					output("Sending Completed Checkpoint Shuttle backward to Replica: " + str(self.predecessorReplica) + " from replica: " + str(self))
+					send(('completed_checkpoint_shuttle', self, completed_checkpoint_shuttle), to = self.predecessorReplica)
+				else:
+					checkpoint_proof = checkpoint_shuttle.checkpoint_proof
+					checkpoint_proof.append(signed_checkpoint_statement)
+					output("Sending checkpoint Shuttle to Successor Replica: " + str(self.successorReplica) + " from " + str(self))
+					send(('forward_checkpoint_shuttle', self, checkpoint_shuttle), to = self.successorReplica)
+		else:
+			output("No forwarding of checkpointing as Replica " + str(self) + " is immutable now")
+
+
+	def receive(msg = ('completed_checkpoint_shuttle', replica, completed_checkpoint_shuttle)):
+		output("Received Completed Checkpoint shuttle at replica: " + str(self) + " from replica: " + str(replica))
+
+		if self.state == State.ACTIVE.value:
+			self.completed_checkpoints += 1
+
+			##Failure Trigger##########
+			failurekey = "completed_checkpoint("+str(self.completed_checkpoints)+")"
+			if failurekey in self.failures:
+				try:
+					self.failureInjections[self.failures[failurekey]] +=1
+				except KeyError:
+					self.failureInjections[self.failures[failurekey]] = 1
+#			print("Failure key" + failurekey)
+#			print("failures " + str(self.failures))
+#			print("Injections at replica during forwarding checkpoint"+ str(self) +" " + str(self.failureInjections))
+			###########################
+
+			####Failure Injections called just after triggers #####
+			if any(key.startswith('sleep') for key in self.failureInjections): ##Sleep
+				sleep = [ key for key in self.failureInjections.keys() if 'sleep' in key][0]
+				output("Sleep Time Failure Triggered at replica: " + str(self))
+				self.failureInjections[sleep] -=1
+				if self.failureInjections[sleep] == 0:
+					self.failureInjections.pop(sleep)
+				sleeptime = sleep[sleep.find('(')+1:sleep.find(')')]
+				time.sleep(int(sleeptime))
+
+			if "crash()" in self.failureInjections : ##Crash Replica
+				output("Killing Replica Failure Triggered at replica: " + str(self))
+				os._exit(-1)
+				return
+
+			if "drop()" in self.failureInjections : ##Drop Message
+				output("Drop Failure Triggered at replica: " + str(self) + " during sending the completed checkpoint shuttle backward")
+				self.failureInjections["drop()"] -=1
+				if self.failureInjections["drop()"] == 0:
+					self.failureInjections.pop("drop()")
+				return
+
+			if "increment_slot()" in self.failureInjections : ##Increment Slot Message
+				output("Increment Slot Failure Triggered at replica: " + str(self))
+				self.failureInjections["increment_slot()"] -=1
+				if self.failureInjections["increment_slot()"] == 0:
+					self.failureInjections.pop("increment_slot()")
+				if self.isHeadFlag:
+					self.slotNo = self.slotNo + 1
+
+			if "extra_op()" in self.failureInjections : ##Extra Operation Message
+				output("Extra Operation Failure Triggered at replica: " + str(self))
+				self.failureInjections["extra_op()"] -=1
+				if self.failureInjections["extra_op()"] == 0:
+					self.failureInjections.pop("extra_op()")
+				execute_operation("put", "a", "a")
+			#######################################################
+
+			#validate completed checkpoint proof
+			if check_validity_of_checkpoint_proof(completed_checkpoint_shuttle.checkpoint_proof):
+				output("Completed Checkpoint shuttle verified at replica: " + str(self))
+
+				#Remove prefix of History From Replicas
+				output("Truncating history for replica: " + str(self) + " upto Slot:" + str(completed_checkpoint_shuttle.checkpoint_slot-1))
+				self.historyoforderproofs = self.historyoforderproofs[self.checkpt_interval:]
+
+				#add checkpoint proof to its history
+				self.historyofcheckpointproofs.append(completed_checkpoint_shuttle.checkpoint_proof)
+
+				if self.isHeadFlag == True:
+					output("Checkpointing Process Completed at replica: " + str(self))
+				else:
+					####Failure Injections#####
+					if "drop_checkpt_stmts()" in self.failureInjections : ##Drop Checkpoint Statements Message
+						output("Drop Checkpoint Failure Triggered at replica: " + str(self))
+						self.failureInjections["drop_checkpt_stmts()"] -=1
+						if self.failureInjections["drop_checkpt_stmts()"] == 0:
+							self.failureInjections.pop("drop_checkpt_stmts()")
+						completed_checkpoint_shuttle.checkpoint_proof = completed_checkpoint_shuttle.checkpoint_proof[(int(len(self.replicaPublicKeys)/2) + 2):]
+#						print(str(completed_checkpoint_shuttle.checkpoint_proof))
+					#######################################################
+					output("Sending completed checkpoint Shuttle to Predecessor Replica: " + str(self.predecessorReplica) + " from " + str(self))
+					send(('completed_checkpoint_shuttle', self, completed_checkpoint_shuttle), to = self.predecessorReplica)
+			else:
+				output("Sending Reconfiguration Request to Olympus due to invalid checkpoint proof from Replica " + str(self))
+				send(('Reconfiguration request from replica', self), to = olympus)
+		else:
+			output("No backward sending of checkpointing as Replica " + str(self) + " is immutable now")
+
+	def execute_retransmitted_request_at_head(operation_object, client, signed_workload):
+
+			requestId = operation_object.requestId
+			if requestId in self.inProcessRequestIds and self.inProcessRequestIds[requestId] ==0 :
+				(result, shuttle) = self.requestIdToResultShuttle[requestId]
+				send(('Retransmitted Response',result, operation_object, shuttle.result_proof, self, "VALID", signed_workload), to = client)
+			elif requestId in self.inProcessRequestIds and self.inProcessRequestIds[requestId] ==1:
+				if await((requestId in self.inProcessRequestIds) and (self.inProcessRequestIds[requestId] == 0)):
+					(result, shuttle) = self.requestIdToResultShuttle[requestId]
+					send(('Retransmitted Response',result, operation_object, shuttle.result_proof, self, "VALID", signed_workload), to = client)
+				elif timeout(head_timeout):
+					output("Timeout detected at head " + str(self) + " for requestId: " + requestId)
+					output("Sending Reconfiguration Request to Olympus from Head " + str(self))
+					send(('Reconfiguration request from replica', self), to = olympus)
+			elif requestId not in self.inProcessRequestIds:
+				self.slotNo = self.slotNo + 1
+				operation_object.slotNo = self.slotNo
+				shuttle = Shuttle()
+				shuttle.operation = operation_object
+				execute_operation_of_client(client, shuttle, signed_workload)
+				if await((requestId in self.inProcessRequestIds) and (self.inProcessRequestIds[requestId] == 0)):
+					(result, shuttle) = self.requestIdToResultShuttle[requestId]
+					send(('Retransmitted Response',result, operation_object, shuttle.result_proof, self,"VALID", signed_workload), to = client)
+				elif timeout(head_timeout):
+					output("Timeout detected at head " + str(self) + " for requestId: " + requestId)
+					output("Sending Reconfiguration Request to Olympus from Head " + str(self))
+					send(('Reconfiguration request from replica', self), to = olympus)
+
+	def receive(msg =('Retransmit Request To Replicas',operation_object, client, signed_workload), from_ = p):
+		output("Received retransmitted request of client: "+ str(client) + " for operation: "+ str(operation_object) + " on replica: " + str(self) + " for requestId: " + operation_object.requestId)
+
+		requestId = operation_object.requestId
+		if requestId not in self.requestIdToForwardedRequests:
+			self.requestIdToForwardedRequests[requestId] = 1
+		else:
+			return
+		if self.state == State.ACTIVE.value:
+			if requestId in self.requestIdToResultShuttle:
+				(result, shuttle) = self.requestIdToResultShuttle[requestId]
+				send(('Retransmitted Response',result, operation_object, shuttle.result_proof, self, "VALID", signed_workload), to = client)
+			else:
+				if isHeadFlag == False:
+					send(('Retransmit To Head', operation_object, client, signed_workload), to = head)
+					if await(((requestId in self.inProcessRequestIds) and (self.inProcessRequestIds[requestId] == 0))):
+						(result, shuttle) = self.requestIdToResultShuttle[requestId]
+						send(('Retransmitted Response',result, operation_object, shuttle.result_proof, self, "VALID", signed_workload), to = client)
+					elif timeout(nonhead_timeout):
+						output("Timeout detected at non-head " + str(self) + " for requestId: " + requestId)
+						output("Sending Reconfiguration Request to Olympus from Non-Head " + str(self))
+						send(('Reconfiguration request from replica', self), to = olympus)
+
+				else:
+					##For handling just one retrasmitted request
+					execute_retransmitted_request_at_head(operation_object, client, signed_workload)
+		elif self.state == State.IMMUTABLE.value:
+			output("Replica " + str(self) + " is immutable now")
+			send(('Retransmitted Response', None, operation_object, None, self, "ERROR", signed_workload), to = client)
+
+	def receive(msg = ('Retransmit To Head' ,operation_object, client, signed_workload), from_ = p):
+		output("Forwarded request received on head:" + str(self) + " for operation:" + str(operation_object) + " from replica: " + str(p))
+		if self.state == State.ACTIVE.value:
+			requestId = operation_object.requestId
+			##For handling just one retrasmitted request
+			if requestId not in self.requestIdToForwardedRequests:
+				self.requestIdToForwardedRequests[requestId] = 1
+				cid  = requestId.split(':')[0]
+				try:
+					self.forwardedmessageforclient[cid]+=1
+				except KeyError:
+					self.forwardedmessageforclient[cid]=0
+				m = self.forwardedmessageforclient[cid]
+
+				##Failure Trigger##########
+				failurekey = "forwarded_request("+str(cid[1:])+","+str(m)+")"
+				if failurekey in self.failures:
+					try:
+						self.failureInjections[self.failures[failurekey]] +=1
+					except KeyError:
+						self.failureInjections[self.failures[failurekey]] = 1
+				###########################
+
+				####Failure Injections called just after triggers #####
+				if any(key.startswith('sleep') for key in self.failureInjections): ##Sleep
+					sleep = [ key for key in self.failureInjections.keys() if 'sleep' in key][0]
+					output("Sleep Time Failure Triggered at replica: " + str(self))
+					self.failureInjections[sleep] -=1
+					if self.failureInjections[sleep] == 0:
+						self.failureInjections.pop(sleep)
+					sleeptime = sleep[sleep.find('(')+1:sleep.find(')')]
+					time.sleep(int(sleeptime))
+
+				if "crash()" in self.failureInjections : ##Crash Replica
+					output("Killing Replica Failure Triggered at replica: " + str(self))
+					os._exit(-1)
+					return
+
+				if "drop()" in self.failureInjections : ##Drop Message
+					output("Drop Failure Triggered at replica: " + str(self) + " when receiving the forwarded request from some replica at head")
+					self.failureInjections["drop()"] -=1
+					if self.failureInjections["drop()"] == 0:
+						self.failureInjections.pop("drop()")
+					return
+
+				if "increment_slot()" in self.failureInjections : ##Increment Slot Message
+					output("Increment Slot Failure Triggered at replica: " + str(self))
+					self.failureInjections["increment_slot()"] -=1
+					if self.failureInjections["increment_slot()"] == 0:
+						self.failureInjections.pop("increment_slot()")
+					if self.isHeadFlag:
+						self.slotNo = self.slotNo + 1
+
+				if "extra_op()" in self.failureInjections : ##Extra Operation Message
+					output("Extra Operation Failure Triggered at replica: " + str(self))
+					self.failureInjections["extra_op()"] -=1
+					if self.failureInjections["extra_op()"] == 0:
+						self.failureInjections.pop("extra_op()")
+					execute_operation("put", "a", "a")
+				#######################################################
+
+				execute_retransmitted_request_at_head(operation_object, client, signed_workload)
+
+	def receive(msg = ('Become Active', head, tail, id, replicas), from_ = olympus, at=(yieldInitializeHistory,)):
+		output("Received become active request from olympus:" + str(olympus) + " on replica: " + str(self))
+		self.state = State.ACTIVE.value
+		self.head = head
+		self.tail = tail
+		index = int(id[1:])
+		self.Id = id
+		if index == 0 :
+			self.isHeadFlag = True
+			self.successorReplica = replicas[1]
+		elif index == len(replicas) - 1:
+			self.isTailFlag = True
+			self.predecessorReplica = replicas[index-1]
+		else :
+			self.successorReplica = replicas[index+1]
+			self.predecessorReplica = replicas[index-1]
+		send(('Initialize History Done', self), to = olympus)
+
+	#Wedge Request handling section
+	def receive(msg = ('Wedge request'), from_ = olympus):
+		output("Recieved wedge request from olympus on replica: " + str(self))
+		self.wedge_request +=1
+		if True:
+			self.state = State.IMMUTABLE.value
+			history_to_send = copy.deepcopy(self.historyoforderproofs)
+			##Failure Trigger##########
+			failurekey = "wedge_request("+str(self.wedge_request)+")"
+			if failurekey in self.failures:
+				try:
+					self.failureInjections[self.failures[failurekey]] +=1
+				except KeyError:
+					self.failureInjections[self.failures[failurekey]] = 1
+			###########################
+
+			####Failure Injections called just after triggers #####
+			if any(key.startswith('sleep') for key in self.failureInjections): ##Sleep
+				sleep = [ key for key in self.failureInjections.keys() if 'sleep' in key][0]
+				output("Sleep Time Failure Triggered at replica: " + str(self))
+				self.failureInjections[sleep] -=1
+				if self.failureInjections[sleep] == 0:
+					self.failureInjections.pop(sleep)
+				sleeptime = sleep[sleep.find('(')+1:sleep.find(')')]
+				time.sleep(int(sleeptime))
+
+			if "crash()" in self.failureInjections : ##Crash Replica
+				output("Killing Replica Failure Triggered at replica: " + str(self))
+				os._exit(-1)
+				return
+
+			if "drop()" in self.failureInjections : ##Drop Message
+				output("Drop Failure Triggered at replica: " + str(self) + " when receiving the wedge request from olympus")
+				self.failureInjections["drop()"] -=1
+				if self.failureInjections["drop()"] == 0:
+					self.failureInjections.pop("drop()")
+				return
+
+			if "truncate_history" in self.failureInjections : ##Drop Message
+				truncate = [ key for key in self.failureInjections.keys() if 'truncate_history' in key][0]
+				output("Truncate History Failure Triggered at replica: " + str(self))
+				self.failureInjections[truncate] -=1
+				if self.failureInjections[truncate] == 0:
+					self.failureInjections.pop(truncate)
+				truncate_count = int(truncate[truncate.find('(')+1:truncate.find(')')])
+				history_to_send = history_to_send[:-truncate_count]
+
+			if "increment_slot()" in self.failureInjections : ##Increment Slot Message
+				output("Increment Slot Failure Triggered at replica: " + str(self))
+				self.failureInjections["increment_slot()"] -=1
+				if self.failureInjections["increment_slot()"] == 0:
+					self.failureInjections.pop("increment_slot()")
+				if self.isHeadFlag:
+					self.slotNo = self.slotNo + 1
+
+			if "extra_op()" in self.failureInjections : ##Extra Operation Message
+				output("Extra Operation Failure Triggered at replica: " + str(self))
+				self.failureInjections["extra_op()"] -=1
+				if self.failureInjections["extra_op()"] == 0:
+					self.failureInjections.pop("extra_op()")
+				execute_operation("put", "a", "a")
+			#######################################################
+
+			wedgedMessage = WedgedMessage()
+			wedgedMessage.history = history_to_send
+			wedgedMessage.checkpoint_history = self.historyofcheckpointproofs
+			output("Sending wedge response from replica: " + str(self) + " to olympus")
+			send(('Wedge response', wedgedMessage, self), to = olympus)
+
+	#Catch up
+	def receive(msg = ('Catch up', operations), from_ = olympus):
+		output("Recieved catch up operations: " + str(operations) + " from olympus on replica: " + str(self))
+
+		self.catch_up +=1
+		
+		##Failure Trigger##########
+		failurekey = "catch_up("+str(self.catch_up)+")"
+		if failurekey in self.failures:
+			try:
+				self.failureInjections[self.failures[failurekey]] +=1
+			except KeyError:
+				self.failureInjections[self.failures[failurekey]] = 1
+#		print("Failure key" + failurekey)
+#		print("failures " + str(self.failures))
+#		print("Injections at replica during catch up"+ str(self) +" " + str(self.failureInjections))
+		###########################
+
+		####Failure Injections called just after triggers #####
+		if any(key.startswith('sleep') for key in self.failureInjections): ##Sleep
+			sleep = [ key for key in self.failureInjections.keys() if 'sleep' in key][0]
+			output("Sleep Time Failure Triggered at replica: " + str(self))
+			self.failureInjections[sleep] -=1
+			if self.failureInjections[sleep] == 0:
+				self.failureInjections.pop(sleep)
+			sleeptime = sleep[sleep.find('(')+1:sleep.find(')')]
+			time.sleep(int(sleeptime))
+
+		if "crash()" in self.failureInjections : ##Crash Replica
+			output("Killing Replica Failure Triggered at replica: " + str(self))
+			os._exit(-1)
+			return
+
+		if "drop()" in self.failureInjections : ##Drop Message
+			output("Drop Failure Triggered at replica: " + str(self) + " when receiving the catch up request from olympus")
+			self.failureInjections["drop()"] -=1
+			if self.failureInjections["drop()"] == 0:
+				self.failureInjections.pop("drop()")
+			return
+
+		if "increment_slot()" in self.failureInjections : ##Increment Slot Message
+			output("Increment Slot Failure Triggered at replica: " + str(self))
+			self.failureInjections["increment_slot()"] -=1
+			if self.failureInjections["increment_slot()"] == 0:
+				self.failureInjections.pop("increment_slot()")
+			if self.isHeadFlag:
+				self.slotNo = self.slotNo + 1
+
+		if "extra_op()" in self.failureInjections : ##Extra Operation Message
+			output("Extra Operation Failure Triggered at replica: " + str(self))
+			self.failureInjections["extra_op()"] -=1
+			if self.failureInjections["extra_op()"] == 0:
+				self.failureInjections.pop("extra_op()")
+			execute_operation("put", "a", "a")
+		#######################################################
+
+		for so_pair in operations:
+			tslotNo  = so_pair[0]
+			operation = so_pair[1]
+			opstr = operation.split(';')
+			requestId = opstr[0]
+			clientId = requestId.split(':')[0]
+			operation_object = Operation()
+			operation_object.requestId = requestId
+			operation_object.slotNo = tslotNo
+			operation_object.command = opstr[1]
+			operation_object.key = opstr[2]
+			operation_object.value = opstr[3]
+			output = execute_operation(opstr[1], opstr[2], opstr[3])
+			result_hash = utils.getHash(output)
+			result_statement = ResultStatement()
+			result_statement.operation = operation_object
+			result_statement.result = result_hash
+			signed_result_statement = utils.getSignedStatement(self.replicaPrivateKey, str(result_statement))
+			self.lastresultstatement[clientId] = (output, signed_result_statement, operation_object)
+		output("Sending caught up response from replica " + str(self))
+		state_hash = utils.getHash(str(self.runningstate))
+		send(('Caught up', state_hash, self.lastresultstatement, self), to = olympus)
+
+	#Get Running State
+	def receive(msg = ('Get running state'), from_ = olympus):
+		output("Sending running state to olympus from replica: " + str(self))
+
+		self.get_running_state +=1
+		##Failure Trigger##########
+		failurekey = "get_running_state("+str(self.get_running_state)+")"
+		if failurekey in self.failures:
+			try:
+				self.failureInjections[self.failures[failurekey]] +=1
+			except KeyError:
+				self.failureInjections[self.failures[failurekey]] = 1
+		###########################
+
+		####Failure Injections called just after triggers #####
+		if any(key.startswith('sleep') for key in self.failureInjections): ##Sleep
+			sleep = [ key for key in self.failureInjections.keys() if 'sleep' in key][0]
+			output("Sleep Time Failure Triggered at replica: " + str(self))
+			self.failureInjections[sleep] -=1
+			if self.failureInjections[sleep] == 0:
+				self.failureInjections.pop(sleep)
+			sleeptime = sleep[sleep.find('(')+1:sleep.find(')')]
+			time.sleep(int(sleeptime))
+
+		if "crash()" in self.failureInjections : ##Crash Replica
+			output("Killing Replica Failure Triggered at replica: " + str(self))
+			os._exit(-1)
+			return
+
+		if "drop()" in self.failureInjections : ##Drop Message
+			output("Drop Failure Triggered at replica: " + str(self) + " when receiving the get running state request from olympus")
+			self.failureInjections["drop()"] -=1
+			if self.failureInjections["drop()"] == 0:
+				self.failureInjections.pop("drop()")
+			return
+
+		if "increment_slot()" in self.failureInjections : ##Increment Slot Message
+			output("Increment Slot Failure Triggered at replica: " + str(self))
+			self.failureInjections["increment_slot()"] -=1
+			if self.failureInjections["increment_slot()"] == 0:
+				self.failureInjections.pop("increment_slot()")
+			if self.isHeadFlag:
+				self.slotNo = self.slotNo + 1
+
+		if "extra_op()" in self.failureInjections : ##Extra Operation Message
+			output("Extra Operation Failure Triggered at replica: " + str(self))
+			self.failureInjections["extra_op()"] -=1
+			if self.failureInjections["extra_op()"] == 0:
+				self.failureInjections.pop("extra_op()")
+			execute_operation("put", "a", "a")
+		#######################################################
+
+		send(('Running state', self.runningstate), to = olympus)
+
+	def receive(msg = ('Kill old replicas'), from_ = olympus):
+		output("-----------Killing replica: " + str(self)+ "-----------------")
+		os._exit(-1)

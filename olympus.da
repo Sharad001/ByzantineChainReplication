@@ -1,0 +1,502 @@
+#!/usr/bin/python
+import sys
+import os
+import time
+import random
+import datetime
+import string
+import itertools
+from utils import Utils, State
+CLIENT = import_da('client')
+REPLICA = import_da('replica')
+config(channel is {fifo,reliable}, clock is lamport)
+
+class Olympus(process):
+
+	def setup(olympusPrivateKey, olympusPublicKey, clientPublicKeys, num_replicas, clients, head_timeout, nonhead_timeout, failures, checkpt_interval):
+	    self.olympusPrivateKey = olympusPrivateKey
+	    self.olympusPublicKey = olympusPublicKey
+	    self.clientPublicKeys = clientPublicKeys
+	    self.replicaPrivateKeys = []
+	    self.replicaPublicKeys = []
+	    self.num_replicas = num_replicas
+	    self.clients = clients
+	    self.head = None
+	    self.configNo = None
+	    self.failures = failures
+	    self.head_timeout = head_timeout
+	    self.nonhead_timeout = nonhead_timeout
+	    self.tail = None
+	    self.isCurrentConfigValid = False
+	    self.currentState = ""
+	    self.replicas = None
+	    self.possibleQuorumWedges = {}
+	    self.wedgeResponseCount = 0
+	    self.caughtUpResponses = {}
+	    self.utils = Utils()
+	    self.createquorumlock = False
+	    self.replicaToIndexMap = {}
+	    self.indexToReplicaMap = {}
+	    self.checkpt_interval = checkpt_interval
+	    self.replicarunningstate = None
+	    self.clientIdtoClients = {}
+	    self.checkedquorums = set()
+
+	def get_failures_for_replica(configNo, failures):
+		replicaToFailures = {}
+		for fkey in failures:
+			key = fkey.split(',')
+			c = int(key[0])
+			r = int(key[1])
+			if c == configNo:
+				fkeyList = failures[fkey].split(';')
+				replicaToFailures[r] = {}
+				for failK in fkeyList:
+					trig = failK[0:(failK.rfind(','))].replace(' ','').strip()
+					fail = failK[(failK.rfind(',')+1):].replace(' ','').strip()
+					replicaToFailures[r][trig] = fail
+		return replicaToFailures
+
+	def run():
+		output("****Starting Olympus " + str(self) + "*******")
+		for i in range(0, len(self.clients)):
+			self.clientIdtoClients['c'+str(i)] = self.clients[i]
+		createNewConfiguration({})
+		intializeVariables()
+		await(each(client in clients, has = some(received(('Finished Processing', _client)))))
+
+	def receive(msg = ('Get Current Config', clientId), from_ = p):
+		send(('Config Response', self.replicas, self.head, self.tail, self.isCurrentConfigValid, self.replicaPublicKeys), to = p)
+
+	def createNewConfiguration(runningstate):
+
+		self.replicaToIndexMap.clear()
+		self.indexToReplicaMap.clear()
+		self.replicaPrivateKeys.clear()
+		self.replicaPublicKeys.clear()
+
+		self.replicas = list(new(REPLICA.Replica, num = self.num_replicas))
+		self.head = replicas[0]
+		self.tail = replicas[-1]
+		if self.configNo is None:
+			self.configNo = 0
+		else:
+			self.configNo += 1
+
+		for i in range(0, self.num_replicas):
+			(replicaPrivateKey, replicaPublicKey) = Utils.getSignedKey(self)
+			self.replicaPrivateKeys.append(replicaPrivateKey)
+			self.replicaPublicKeys.append(replicaPublicKey)
+
+		replicaFailures = get_failures_for_replica(self.configNo, failures)
+		for i in range(num_replicas):
+			self.replicaToIndexMap[replicas[i]] = i
+			self.indexToReplicaMap[i] = replicas[i]
+			replicaFailure = []
+			if i in replicaFailures:
+				replicaFailure = replicaFailures[i]
+			setup(replicas[i], (self, self.replicaPublicKeys, self.replicaPrivateKeys[i], self.olympusPublicKey, State.PENDING.value,head_timeout, nonhead_timeout, replicaFailure, self.checkpt_interval, runningstate, self.clientPublicKeys))
+		start(replicas)
+
+		for i in range(num_replicas):
+			send(('Become Active', head, tail, 'r'+str(i), replicas), to = replicas[i])
+		await(each(replica in self.replicas , has = some(received(('Initialize History Done', _replica)))))
+
+	def intializeVariables():
+		## Intializing all variables and clearing previous data
+		self.currentState = "Running"
+		self.possibleQuorumWedges.clear()
+		self.caughtUpResponses.clear()
+		self.checkedquorums.clear()
+		self.wedgeResponseCount = 0
+		self.createquorumlock = False
+		self.replicarunningstate = None
+		self.isCurrentConfigValid = True
+
+
+	def check_validity_of_result_proof(actual_result, result, result_proof):
+		if actual_result != result:
+			return False
+		result_statements = result_proof
+		for i in range(0, len(replicas)):
+			try:
+				statement = utils.verifySignature(result_statements[i] , replicaPublicKeys[i])
+				hash = statement.decode('UTF-8').split(';')[-1]
+				if utils.verifyHash(result, hash.encode('utf-8')) == False:
+					return False
+			except:
+				return False
+		return True
+
+	def get_so_pair_from_order_statement(order_statement):
+		strings = order_statement.split(';')
+		operation = strings[2]+';'+strings[3]+';'+strings[4]
+		slot = int(strings[1])
+		return (slot, operation)
+
+	def check_validity_of_history(order_proofs):
+		slotNos = []
+		for i in range(0, len(order_proofs)):
+			try:
+				if len(order_proofs[i])>0:
+					first_order_statement = utils.verifySignature(order_proofs[i][0], self.replicaPublicKeys[0]).decode('UTF-8')
+					so_pair = get_so_pair_from_order_statement(first_order_statement)
+					if so_pair[0] in slotNos:
+						return False
+					else:
+						slotNos.append(so_pair[0])
+					for j in range(1, len(order_proofs[i])):
+						order_statement = utils.verifySignature(order_proofs[i][j], self.replicaPublicKeys[j]).decode('UTF-8')
+						if order_statement != first_order_statement:
+							return False
+			except:
+				return False
+
+		return True
+
+	def check_validity_of_checkpoint_proof(checkpoint_proof):
+		checkpoint_set = set()
+		for i in range(0, len(checkpoint_proof)):
+			verification = True
+			checkpoint_statement = ""
+			try:
+				checkpoint_statement = utils.verifySignature(checkpoint_proof[i], self.replicaPublicKeys[i]).decode('UTF-8')
+			except Exception:
+				verification = False
+			if verification == True:
+				checkpoint_set.add(checkpoint_statement)
+		if len(checkpoint_set) > (int(len(replicaPublicKeys)/2) + 1):
+			return False
+		return True
+
+	def get_list_of_order_statements(order_proof):
+		order_statements = []
+		for i in range(0, len(order_proof)):
+			order_statement = utils.verifySignature(order_proof[i], self.replicaPublicKeys[i]).decode('UTF-8')
+			order_statements.append(order_statement)
+		return order_statements
+
+	def check_for_prefix(order_statements_current, order_statements_successor):
+		for i in range(0, len(order_statements_current)):
+			if order_statements_current[i]!=order_statements_successor[i]:
+				return False
+		return True
+
+
+	##Check consistency of histories of quorum
+	def check_consistency_of_quorum(quorum):
+		quorumsize = len(quorum)
+		history = self.possibleQuorumWedges[quorum[quorumsize -1]].history
+		smallestHistorySize = len(history)
+		for i in range(0, smallestHistorySize):
+			flag = 0
+			so_pair = None
+			order_statement_list = None
+			for j in range(quorumsize-1, -1, -1):
+				try:
+					if flag ==0 :
+						history = self.possibleQuorumWedges[quorum[j]].history
+						order_statement_list = get_list_of_order_statements(history[i])
+						so_pair = get_so_pair_from_order_proof(history[i])
+						flag = 1
+					else:
+						history = self.possibleQuorumWedges[quorum[j]].history
+						temp_order_statement_list = get_list_of_order_statements(history[i])
+						temp_so_pair = get_so_pair_from_order_proof(history[i])
+
+						if temp_so_pair != so_pair:
+							return False
+
+						if check_for_prefix(temp_order_statement_list, order_statement_list) == False:
+							return False
+				except:
+					return False
+		return True
+
+	def get_so_pair_with_request_from_order_statement(order_statement):
+		so_pair = None
+		try:
+			order_statement = utils.verifySignature(order_statement, self.replicaPublicKeys[0]).decode('UTF-8')
+			strings = order_statement.split(';')
+			operation = strings[0]+';'+strings[2]+';'+strings[3]+';'+strings[4]
+			slot = int(strings[1])
+			so_pair = (slot, operation)
+		except:
+			pass
+		return so_pair
+	
+	##Get unapplied operations for replicas
+	def get_operations_for_replica(quorum):
+
+		quorumsize = len(quorum)
+		longesthistory = self.possibleQuorumWedges[quorum[0]].history
+		longesthistorysize = len(longesthistory)
+		so_pairs = []
+		operationspending = {}
+
+		for i in range(0, longesthistorysize):
+			so_pairs.append(get_so_pair_with_request_from_order_statement(longesthistory[i][0]))
+
+		operationspending[quorum[0]] = []
+#		print("so _ pairs for start replica : "+ str(quorum[0]) + " " +str(so_pairs))
+		for i in range(1, quorumsize):
+			historysize = len(self.possibleQuorumWedges[quorum[i]].history)
+			operationspending[quorum[i]] = []
+			for j in range(historysize, longesthistorysize):
+				operationspending[quorum[i]].append(so_pairs[j])
+
+		return operationspending
+
+	def check_for_same_baseline_of_checkpoint_proof(quorum):
+
+		##Validation for checkpoint proofs of replicas in quorum
+		headreplicawedged  = self.possibleQuorumWedges[quorum[0]]
+
+		headreplicahistory = headreplicawedged.history
+		headreplicaslotNo = None
+		if len(headreplicahistory) > 0:
+			headreplicaslotNo =  get_so_pair_from_order_proof(headreplicahistory[0])[0]
+
+		samebaseline = True
+
+		for replica in quorum:
+
+			replicawedged  = self.possibleQuorumWedges[replica]
+			replicalastcheckpointproof = []
+			if len(replicawedged.checkpoint_history) > 0:
+				replicalastcheckpointproof = replicawedged.checkpoint_history[-1]
+			if check_validity_of_checkpoint_proof(replicalastcheckpointproof) == False:
+#				print("false 1")
+				return False, False
+
+			replicahistory = replicawedged.history
+			replicaslotNo = None
+			if len(replicahistory) > 0:
+				replicaslotNo =  get_so_pair_from_order_proof(replicahistory[0])[0]
+
+			if replicaslotNo != None and headreplicaslotNo ==None:
+				return False, False
+
+			if replicaslotNo!= None and headreplicaslotNo !=None and replicaslotNo > headreplicaslotNo:
+				replicasecondlastcheckpointproof = []
+				if len(replicawedged.checkpoint_history) > 1:
+					replicasecondlastcheckpointproof = replicawedged.checkpoint_history[-2]
+				if check_validity_of_checkpoint_proof(replicasecondlastcheckpointproof) == False:
+#					print("false 2")
+					return False, False
+
+				samebaseline = False
+			elif replicaslotNo!= None and headreplicaslotNo !=None and replicaslotNo < headreplicaslotNo :
+				return False, False
+
+		return True, samebaseline
+
+	def get_so_pair_from_order_proof(order_proof):
+		so_pair = None
+		if len(order_proof) > 0:
+			try:
+				order_statement = utils.verifySignature(order_proof[0], self.replicaPublicKeys[0]).decode('UTF-8')
+				so_pair = get_so_pair_from_order_statement(order_statement)
+			except:
+				pass
+		return so_pair
+
+
+	def get_operations_for_replica_in_diff(quorum):
+
+		quorumsize = len(quorum)
+		longesthistory = self.possibleQuorumWedges[quorum[0]].history
+		longesthistorysize = len(longesthistory)
+		so_pairs = []
+		slotToIndex = {}
+		operationspending = {}
+
+		for i in range(0, longesthistorysize):
+			so_pair = get_so_pair_with_request_from_order_statement(longesthistory[i][0])
+			so_pairs.append(so_pair)
+			slotToIndex[so_pair[0]] = i
+
+		operationspending[quorum[0]] = []
+
+		for i in range(1, quorumsize):
+			history = self.possibleQuorumWedges[quorum[i]].history
+			historysize = len(history)
+			operationspending[quorum[i]] = []
+			try:
+				so_pair = get_so_pair_with_request_from_order_statement(history[historysize-1][0])
+				startingindex = slotToIndex[so_pair[0]]
+				for j in range(startingindex+1, longesthistorysize):
+					operationspending[quorum[i]].append(so_pairs[j])
+			except:
+				continue
+
+		return operationspending
+
+	def sendResultToClients(quorum):
+		lastresultstatement = self.caughtUpResponses[quorum[0]][1]
+		clients = lastresultstatement.keys()
+		clientsToResultMap ={}
+		for cid in clients:
+			resultobject = lastresultstatement[cid]
+			result = resultobject[0]
+			operation_object = resultobject[2]
+			resultstatement = ""
+			replicaIndex = self.replicaToIndexMap[quorum[0]]
+			try:
+				resultstatement = utils.verifySignature(resultobject[1] , replicaPublicKeys[replicaIndex])
+			except :
+				continue
+			quorumflag = True
+			for i in range(1,len(quorum)):
+				try:
+					tempresultobject = self.caughtUpResponses[quorum[i]][1][cid]
+					replicaIndex = self.replicaToIndexMap[quorum[i]]
+					tempresult = tempresultobject[0]
+					tempresultstatement = ""
+					tempreplicaIndex = self.replicaToIndexMap[quorum[i]]
+					tempresultstatement = utils.verifySignature(tempresultobject[1] , replicaPublicKeys[tempreplicaIndex])
+					if result != tempresult or resultstatement != tempresultstatement:
+						quorumflag = False
+						break
+				except :
+					quorumflag = False
+					break
+
+			if quorumflag == False:
+				continue
+
+			output("Sending result " + result + " to client "+ str(cid) + " from olympus")
+			send(('Result from olympus', result, operation_object.requestId), to = self.clientIdtoClients[cid])
+
+
+
+	def getReplicasFromWedges():
+		treplicas = self.possibleQuorumWedges.keys()
+		ind = []
+		for replica in treplicas:
+			ind.append(self.replicaToIndexMap[replica])
+		ind.sort()
+		freplicas = []
+		for i in ind:
+			freplicas.append(self.indexToReplicaMap[i])
+
+		return freplicas
+
+	def check_for_quorum_and_create_new_replicas():
+
+		self.createquorumlock = True
+#print("Trying to create quorum")
+		size = int(len(self.replicas)/2) + 1
+		tempreplicas = getReplicasFromWedges()
+		intialsize = len(tempreplicas)
+		quorumSets = list(itertools.combinations(tempreplicas, size))
+#		print(str(quorumSets))
+		quorumformed = False
+		for quorum in quorumSets:
+
+			if quorum in self.checkedquorums:
+				continue
+			self.checkedquorums.add(quorum)
+			###Validation of history of replicas in quorum
+			validateHistory = True
+			for replica in quorum:
+				wedged = self.possibleQuorumWedges[replica]
+				if check_validity_of_history(wedged.history) == False:
+					validateHistory = False
+					break
+			if validateHistory == False:
+#				output("Validation of order proof failed in quorum " + str(quorum))
+				continue
+
+#			output("Validation of order proof is correct")
+			(validity,samebaselineofcheckpointproofs) = check_for_same_baseline_of_checkpoint_proof(quorum)
+
+			if validity == False:
+				continue
+
+#			output("Validation of checkpoint proof is correct")
+			operationspending = {}
+#			output("samebaseline flag" + str(samebaselineofcheckpointproofs))
+			if samebaselineofcheckpointproofs == True:
+				consistencyflag = check_consistency_of_quorum(quorum)
+				if consistencyflag == False:
+					continue
+				operationspending = get_operations_for_replica(quorum)
+			else:
+				operationspending = get_operations_for_replica_in_diff(quorum)
+			
+			output("Sending catch up messages to quorum: " + str(quorum))
+			testquorum = quorum
+			for replica in quorum:
+				send(('Catch up', operationspending[replica]), to = replica)
+			if await(each(replica in testquorum , has = some(received(('Caught up',_,_, _replica))))):pass
+			elif timeout(10): continue
+			result_set = set()
+			for replica in quorum:
+				result = self.caughtUpResponses[replica][0]
+				result_set.add(result)
+
+			if len(result_set) != 1:
+				continue
+			else:
+				result_hash = result_set.pop()
+				output("Quorum successfully formed with replicas: " + str(quorum))
+				sendResultToClients(quorum)
+				while True:
+					rep = random.SystemRandom().choice(quorum)
+					send(('Get running state'), to = rep)
+					await(some(received(('Running state',_), from_ = rep)))
+					temphash = utils.getHash(str(self.replicarunningstate))
+					if utils.verifyTwoHash(temphash, result_hash) == True:
+						output("Successful running state recieved at olympus from replica: " + str(rep))
+						break
+				alloldreplicas = self.replicas
+				createNewConfiguration(self.replicarunningstate)
+				intializeVariables()
+				send(('Kill old replicas'), to = alloldreplicas)
+				quorumformed = True
+				break
+		if quorumformed == True:
+			return
+		output("Quorum not created!! , Trying Again. ")
+		actualsize = len(getReplicasFromWedges())
+		if actualsize > intialsize:
+			check_for_quorum_and_create_new_replicas()
+			
+		self.createquorumlock = False
+
+	def receive(msg = ('Get Config' ,clientid), from_ = p):
+		send(('Config Response', self.replicas, self.head, self.tail, self.isCurrentConfigValid, self.replicaPublicKeys), to = p)
+
+	def receive(msg = ('Reconfiguration request from replica' ,replica), from_ = p):
+		output("Reconfiguration request recieved at olympus from replica: " + str(p))
+		output("Current state " + str(self.currentState))
+		if self.currentState != "Reconfig":
+			self.isCurrentConfigValid = False
+			self.currentState = "Reconfig"
+			send(('Wedge request'), to = self.replicas)
+
+	def receive(msg = ('Reconfiguration request from client' , client_result, result, result_proof, client), from_ = p):
+		output("Reconfiguration request recieved at olympus from client: " + str(p))
+		if self.currentState != "Reconfig":
+			if check_validity_of_result_proof(client_result, result, result_proof) == False:
+				self.isCurrentConfigValid = False
+				self.currentState = "Reconfig"
+				send(('Wedge request'), to = self.replicas)
+
+	def receive(msg = ('Wedge response' ,wedgedMessage, replica), from_ = p):
+		output("Wedge response recieved at olympus from replica: " + str(replica))
+		self.wedgeResponseCount +=1
+		self.possibleQuorumWedges[replica] = wedgedMessage
+		if self.wedgeResponseCount >=  int(len(self.replicas)/2) +1 :
+			if self.isCurrentConfigValid == False and self.createquorumlock == False:
+				check_for_quorum_and_create_new_replicas()
+
+	def receive(msg = ('Caught up', state_hash, lastresultstatements, replica), from_ = p):
+		output("Caught up message response recieved at olympus from replica: " + str(replica))
+#print("state_hash " + str(state_hash) + " " + str(lastresultstatements))
+		self.caughtUpResponses[replica] = (state_hash, lastresultstatements)
+
+	def receive(msg = ('Running state', running_state), from_ = p):
+		output("Running state recieved at olympus from replica: " + str(p))
+		self.replicarunningstate = running_state
